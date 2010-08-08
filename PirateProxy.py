@@ -37,7 +37,9 @@ REVISION HISTORY:
  - ...previous versions...
    Maybe I'll add these someday.
 	
-TODO: 
+TODO:
+ - Remove connection close hack, identify content length and use it as delimiter....
+ - Identify if the host has changed and retain the connection if possible or initiate new connection
  - Delete duplicate files
  - Give the archived files file name extensions (.txt, .html, etc.)
  - Provide easy way to view archived pages, links from error messages
@@ -66,9 +68,11 @@ based on a combination of code from the following sources:
 # default port if none specified on command line
 PORT = 8119
 
-# Only save files with this content type prefixes (always lowercase)
-ACCEPTED_CONTENT_TYPES = ['audio/mpeg', 'video/x-flv', 'video/mp4']
-FILE_EXTENSIONS = {'audio/mpeg':'.mp3', 'video/x-flv':'.flv', 'video/mp4':'.mp4'}
+# Only save files with these content type prefixes (always lowercase)
+ACCEPTED_CONTENT_TYPES = {'audio/mpeg' :'.mp3',
+			  'video/x-flv':'.flv',
+			  'video/mp4'  :'.mp4'
+			  }
 
 # Tagger rename pattern
 # %A (artist), %a (album), %t (title), %n (track number),
@@ -88,6 +92,7 @@ SHOW_ERRORS = 1
 # the address to bind the server to
 ADDR_TO_BIND_TO = '127.0.0.1'
 
+# put all the files from the same domain in the same directory ignoring their full path
 DOMAIN_ONLY_DIRS = True
 
 # Use date-stamped filenames or plain numbered ones?
@@ -304,11 +309,20 @@ def content_type_accepted(content_type):
 	if content_type is None:
 		return False
 		
-	for i in ACCEPTED_CONTENT_TYPES:
+	for i in ACCEPTED_CONTENT_TYPES.keys():
 		if content_type.startswith(i):
 			return True
 	return False
 		
+def file_extension_for(content_type):
+	if content_type is None:
+		return ''
+		
+	for i in ACCEPTED_CONTENT_TYPES.keys():
+		if content_type.startswith(i):
+			return ACCEPTED_CONTENT_TYPES[i]
+	return ''
+	
 
 def archive_connection(klass, request, url, data):
 	filename = None
@@ -358,7 +372,7 @@ def archive_connection(klass, request, url, data):
 		# Switch to the data file
 		data = data[n+4:]
 		filename = filename[:-len('.headers')]
-		filename = filename + FILE_EXTENSIONS[content_type]
+		filename = filename + file_extension_for(content_type)
 		log('Switching to file: '+filename+' -- end of headers\n', v=2)
 		f = open(filename, 'w')
 		archive_files[klass][0] = f
@@ -625,6 +639,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		header = self.buffer.getvalue()
 		self.buffer = StringIO()
 		if header and header[0] != '\r':
+			header = header.replace('keep-alive', 'close')
+			header = header.replace('Keep-Alive', 'Close')
 			self.rawheaders.write(header)
 			self.rawheaders.write('\n')
 		else:
@@ -680,7 +696,7 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		if http_proxy:
 			log('(%d) sending request to the next http proxy:\n' % self.id, v=2)
 		else:
-			log('(%d) sending request to server:\n' % self.id, v=2)
+			log('(%d) sending request to server:%s\n' % (self.id, self.host), v=2)
 		log(request, v=2)
 
 		# send the request and headers on through to the next hop
@@ -847,15 +863,16 @@ if __name__ == '__main__':
 	if len(sys.argv) >= 2:
 		PORT = int(sys.argv[1])
 
-	if len(sys.argv) > 3 :	# 3th param: the next-step HTTP proxy can specified here (overrides the environment variable)
-		os.environ['http_proxy'] = sys.argv[3]
 	# display which proxy we're using
 	http_proxy = os.environ.get('http_proxy')
 	if not http_proxy :
 		http_proxy = os.environ.get('HTTP_PROXY')
+		
+	if len(sys.argv) >= 3 :	# 3th param: the next-step HTTP proxy can specified here (overrides the environment variable)
+		http_proxy = sys.argv[2]
 	
 	if http_proxy :
-		log("Next hop proxy: %s\n" % http_proxy, 0)
+		log("Next hop proxy: %s\n" % http_proxy, v=1)
 		scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
 		# set host and port to the proxy
 		if ':' in netloc:
