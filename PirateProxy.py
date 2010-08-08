@@ -67,8 +67,8 @@ based on a combination of code from the following sources:
 PORT = 8119
 
 # Only save files with this content type prefixes (always lowercase)
-ACCEPTED_CONTENT_TYPES = ['audio/mpeg', 'video/x-flv']
-FILE_EXTENSIONS = {'audio/mpeg':'.mp3', 'video/x-flv':'.flv'}
+ACCEPTED_CONTENT_TYPES = ['audio/mpeg', 'video/x-flv', 'video/mp4']
+FILE_EXTENSIONS = {'audio/mpeg':'.mp3', 'video/x-flv':'.flv', 'video/mp4':'.mp4'}
 
 # Tagger rename pattern
 # %A (artist), %a (album), %t (title), %n (track number),
@@ -87,6 +87,8 @@ SHOW_ERRORS = 1
 
 # the address to bind the server to
 ADDR_TO_BIND_TO = '127.0.0.1'
+
+DOMAIN_ONLY_DIRS = True
 
 # Use date-stamped filenames or plain numbered ones?
 ARCHIVE_FILE_NAMES = 'plain'
@@ -205,6 +207,31 @@ class Mp3Tagger(object):
 
 tagger = Mp3Tagger();
 
+def re_exact_match(pattern, string):
+	m = re.match(pattern, string)
+	if m is None:
+		return False
+	return m.start() == 0 and m.end() == len(string)	
+	
+
+def keep_only_domain(webpath):
+	print webpath
+	# Isolate the domain
+	if len(webpath) < 2:
+		return webpath
+	domain = webpath[1]
+	# Throw away usernames
+	if domain.find('@') >= 0:
+		i = domain.index('@')
+		domain = domain[i+1:]
+	# for everything except ipv4 addresses
+	# keep only the last two parts (eg. static.farm.youtube.com => youtube.com)
+	if not re_exact_match('([0-9]{1,3}\.){3}[0-9]{1,3}', domain):
+		domain = '.'.join(domain.split('.')[-2:])
+	return ['http', domain]
+	
+	
+
 def archive_url2filename(url, makeNew=1):
 	dirname = url
 	dirname = string.replace(dirname, '://', os.sep, 1)
@@ -217,6 +244,8 @@ def archive_url2filename(url, makeNew=1):
 			dirname = string.replace(dirname, c, '%'+string.upper(binascii.b2a_hex(c)))
 
 	dirname2 = string.split(dirname, os.sep)
+	if DOMAIN_ONLY_DIRS:
+		dirname2 = keep_only_domain(dirname2)
 	for i in range(len(dirname2)):
 		if len(dirname2[i]) > ARCHIVE_MAXIMUM_FILE_SIZE:
 			dirname2[i] = md5(dirname2[i]).hexdigest()
