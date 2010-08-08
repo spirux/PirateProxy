@@ -32,7 +32,7 @@ REVISION HISTORY:
    Supports long file names
    Fixed a bug where it'd encode filenames on all systems (not just Windows)
    
- - Turned it to PirateProxy. Only saves mp3s and runs a tagger on the mp3.
+ - Turned it to PirateProxy. Only saves mp3s and runs a tagger on any mp3s.
 
  - ...previous versions...
    Maybe I'll add these someday.
@@ -67,8 +67,8 @@ based on a combination of code from the following sources:
 PORT = 8119
 
 # Only save files with this content type prefixes (always lowercase)
-ACCEPTED_CONTENT_TYPES = ['audio/mpeg']
-FILE_EXTENSIONS = {'audio/mpeg':'.mp3'}
+ACCEPTED_CONTENT_TYPES = ['audio/mpeg', 'video/x-flv']
+FILE_EXTENSIONS = {'audio/mpeg':'.mp3', 'video/x-flv':'.flv'}
 
 # Tagger rename pattern
 # %A (artist), %a (album), %t (title), %n (track number),
