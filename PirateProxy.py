@@ -99,14 +99,12 @@ DOMAIN_ONLY_DIRS = True
 ARCHIVE_FILE_NAMES = 'plain'
 # ARCHIVE_FILE_NAMES = 'date'
 
-# Start in archiving mode or in viewing mode?
+# Start in archiving mode ?
 ARCHIVE_ACTION_MODE = 'archive'
-#ARCHIVE_ACTION_MODE = 'view'
 #ARCHIVE_ACTION_MODE = 'off'
 
 ARCHIVE_ACTION_NAMES = {
 	'archive':'Archiving',
-	'view':'Viewing',
 	'off':'Off'
 }
 
@@ -169,13 +167,8 @@ def handle_error(self):
 ###############################################################################
 # This is the section that is archiver-specific...
 
-archive_files = {}	# File in which to write the data
-archive_status = {} # Status of the connection 
-# (headers if it's not there, None if we shouldn't log it, otherwise 'body')
+###############################################################################
 
-# Tagger options
-#options = {'unique_file_ids': None, 'field_delim': ':', 'showGenres': None, 'lyrics': None, 'run_profiler': None, 'nocolor': None, 'url_frames': [], 'remove_images': None, 'convertVersion': 0, 'remove_all': 0, 'year': None, 'images': None, 'user_url_frames': [], 'jep_118': None, 'album': None, 'no_tdtg': 0, 'textFrames': [], 'title': None, 'remove_v2': 0, 'comments': None, 'strict': None, 'play_count': None, 'lametag': None, 'zeropad': True, 'track': None, 'fs_encoding': 'utf-8', 'objects': None, 'genre': None, 'verbose': None, 'writeImages': None, 'publisher': None, 'rename_pattern': TAGGER_PATTERN, 'artist': None, 'nfo': None, 'showImagesTypes': None, 'force_update': 0, 'bpm': None, 'track_total': None, 'textEncoding': None, 'remove_v1': 0, 'remove_comments': None, 'writeObjects': None, 'tagVersion': 48, 'debug': None, 'remove_lyrics': None, 'userTextFrames': []}
-#
 class Mp3Tagger(object):
 	def __init__(self):
 		self.fs_encoding = sys.getfilesystemencoding();
@@ -209,8 +202,11 @@ class Mp3Tagger(object):
 			log(str(ex) + '\n', v=1);
 			
 		return False
-
+	
+# We have a single tagger object for tagging mp3s
 tagger = Mp3Tagger();
+
+###############################################################################
 
 def re_exact_match(pattern, string):
 	m = re.match(pattern, string)
@@ -218,9 +214,7 @@ def re_exact_match(pattern, string):
 		return False
 	return m.start() == 0 and m.end() == len(string)	
 	
-
 def keep_only_domain(webpath):
-	print webpath
 	# Isolate the domain
 	if len(webpath) < 2:
 		return webpath
@@ -322,166 +316,123 @@ def file_extension_for(content_type):
 		if content_type.startswith(i):
 			return ACCEPTED_CONTENT_TYPES[i]
 	return ''
+
+###############################################################################
+
+class Archiver(object):
+	def __init__(self, sender):
+		# (file, filename) Use a StringIO object to hold the header
+		self.archive = [StringIO(), None]
+		#'init' ->'headers' -> 'body'|'noarchive' -> 'closed'
+		self.status = 'init' 
+		self.sender = sender
 	
-
-def archive_connection(klass, request, url, data):
-	filename = None
-	if not archive_files.has_key(klass):
-		# Use a StringIO object to hold the header and store it in the dictionary:
-		f = StringIO()
-		archive_files[klass] = [f, None]
-
-		# Clean the request header:
-		request = string.replace(request, '\r', '')
-		request = string.replace(request, '\n', '')
-
-		# Write out the URL/date header:
-		f.write(request + ' ' + 
-			 time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) 
-			 + '\r\n')
+	def archive_headers(self, request, url, rawheaders):
+				f, filename = self.archive
+		if self.status == 'init':
+			self.status = 'headers'
+			# Clean the request header:
+			request = string.replace(request, '\r', '')
+			request = string.replace(request, '\n', '')
+			# Write out the URL/date header:
+			f.write(request + ' ' + 
+				 time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) 
+				 + '\r\n')
 		
-	else:
-		f, filename = archive_files[klass]
-	
-	# File should not be saved
-	if f == None:
-		return
-	
-	if not archive_status.has_key(klass) and string.find(data, '\r\n\r\n'):		
-		# We've found the end of the headers
-		n = string.find(data, '\r\n\r\n')
-		f.write(data[:n+4])
-		content_type = extract_content_type(data[:n+4])
-		# Discard the file if it's not among the accepted content-types:
-		if not content_type_accepted(content_type):
-			log('Discarding ' + url + ' -- content type not for archival\n', v=2)
-			archive_files[klass] = [None, None]
-			archive_status[klass] = None
+		# File should not be saved
+		if self.status == 'noarchive':
 			return
 		
-		# Create the directory name based on the URL
-		filename = archive_url2filename(url)
+		n = string.find(data, '\r\n\r\n')
+		if self.status == 'headers' and n >= 0:
+			# We've found the end of the headers
+			f.write(data[:n+4])
+			content_type = extract_content_type(data[:n+4])
+			# Discard the file if it's not among the accepted content-types:
+			if not content_type_accepted(content_type):
+				log('Discarding ' + url +
+					' -- content type not for archival\n', v=2)
+				self.archive = [None, None]
+				self.status = 'noarchive'
+				return
+			
+			# Create a directory name based on the URL
+			filename = archive_url2filename(url)
+			
+			# Store the stringIO object to a real file.
+			log('Opening file: '+filename+'\n', v=2)
+			open(filename, 'w').write(f.getvalue())
+			f.close()
+			
+			# Switch to the data file
+			data = data[n+4:]
+			filename = filename[:-len('.headers')]
+			filename = filename + file_extension_for(content_type)
+			log('Switching to file: '+filename+' -- end of headers\n', v=2)
+			f = open(filename, 'w')
+			self.archive = [f, filename]
+			self.status = 'body'
 		
-		# Store the stringIO object to a real file.
-		log('Opening file: '+filename+'\n', v=2)
-		hf = open(filename, 'w')
-		hf.write(f.getvalue())
-		hf.close()
-		f.close()
 		
-		# Switch to the data file
-		data = data[n+4:]
-		filename = filename[:-len('.headers')]
-		filename = filename + file_extension_for(content_type)
-		log('Switching to file: '+filename+' -- end of headers\n', v=2)
-		f = open(filename, 'w')
-		archive_files[klass][0] = f
-		archive_files[klass][1] = filename
-		archive_status[klass] = 'body'
 	
-	f.write(data)
-
-def archive_handle_request(self):
-	global ARCHIVE_ACTION_MODE
-	filename = self.path[1:]
-	filename = string.replace(filename, '/', os.sep)
-
-	if self.path in ['/', '/mode-view', '/mode-archive', '/mode-off']: # @@KLUDGE: this should be done with a real POST but I can't figure out how to read the POST contents without a lot of pain :-(
-		if self.method == 'POST':
-			if self.path == '/mode-view': ARCHIVE_ACTION_MODE = 'view'
-			elif self.path == '/mode-archive': ARCHIVE_ACTION_MODE = 'archive'
-			elif self.path == '/mode-off': ARCHIVE_ACTION_MODE = 'off'
+	def archive_connection(self, request, url, data):
+		#print "ARCHIVE_CONNECTION" #TODO
+		f, filename = self.archive
+		if self.status == 'init':
+			self.status = 'headers'
+			# Clean the request header:
+			request = string.replace(request, '\r', '')
+			request = string.replace(request, '\n', '')
+			# Write out the URL/date header:
+			f.write(request + ' ' + 
+				 time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) 
+				 + '\r\n')
 		
-		out = """<p>This is the <a href="http://logicerror.com/archiverProxy">Archiver Proxy</a>. It archives the contents of every page you visit, and allows you to view them at a later date.</p>
-		"""
+		# File should not be saved
+		if self.status == 'noarchive':
+			return
 		
-		for mode in ['archive', 'view', 'off']:
-			if mode == ARCHIVE_ACTION_MODE:
-				out += '<p>You are currently: <strong>' + ARCHIVE_ACTION_NAMES[mode] + '</strong>.</p>'
-			else:
-				out += '<form method="post" action="mode-' + mode + '">Switch to: <input type="submit" name="mode" value="' + ARCHIVE_ACTION_NAMES[mode] + '" /></form>'
+		n = string.find(data, '\r\n\r\n')
+		if self.status == 'headers' and n >= 0:
+			# We've found the end of the headers
+			f.write(data[:n+4])
+			content_type = extract_content_type(data[:n+4])
+			# Discard the file if it's not among the accepted content-types:
+			if not content_type_accepted(content_type):
+				log('Discarding ' + url +
+					' -- content type not for archival\n', v=2)
+				self.archive = [None, None]
+				self.status = 'noarchive'
+				return
+			
+			# Create a directory name based on the URL
+			filename = archive_url2filename(url)
+			
+			# Store the stringIO object to a real file.
+			log('Opening file: '+filename+'\n', v=2)
+			open(filename, 'w').write(f.getvalue())
+			f.close()
+			
+			# Switch to the data file
+			data = data[n+4:]
+			filename = filename[:-len('.headers')]
+			filename = filename + file_extension_for(content_type)
+			log('Switching to file: '+filename+' -- end of headers\n', v=2)
+			f = open(filename, 'w')
+			self.archive = [f, filename]
+			self.status = 'body'
 		
-		out += '<p>You can also <a href="http/">browse your archived pages</a>.</p>'
-		self.show_response(200, out, 'Archiver Proxy Home')
-		
-	elif not os.access(filename, os.F_OK):
-		self.show_response(404, "The file you requested could not be found.")
-	elif stat.S_ISDIR(os.stat(filename)[stat.ST_MODE]):
-		listing = os.listdir(filename)
-		dirpath = ''
-		dircode = '</p>'
-		dirlist = string.split(filename, os.sep)
-		dirlist.reverse()
-		for dir in dirlist:
-			if dir == "": continue
-			dircode = ' <a href="' + dirpath + '">' + dir + '</a> ' + os.sep + dircode
-			dirpath += '../'
-		dircode = '<p> / ' + dircode
-		out = dircode + '\n'
-		out += """<p>Please select a directory or file to view:</p>
-		
-		<ul>"""
-		for item in listing:
-			line = ""
-			if item[-8:] == '.headers': continue  # Don't display the header files
-			line += '\n	<li><a href="'
-			if not stat.S_ISREG(os.stat(os.path.join(filename, item))[stat.ST_MODE]): item += os.sep
-			line += item + '">' + item + '</a></li>'
-			out += (line+'\n')
-		out += ('</ul>\n')
-		
-		self.show_response(200, out, "File Browser")
-
-	elif stat.S_ISREG(os.stat(filename)[stat.ST_MODE]):
-		h = open(filename + '.headers').readlines()[1:]
-		for line in h:
-			self.push(line)
-		del h
-		d = open(filename).readlines()
-		for line in d:
-			self.push(line)
-		
-	else: 
-		self.show_response(500, "<strong>An internal error has ocurred:</strong> The file you selected is not valid.\n", "Internal Error")
-
-def archive_close(klass):
-	filename = None
-	if archive_files.has_key(klass):
-		filename = archive_files[klass][1]
-		del archive_files[klass]
-		
-	if archive_status.pop(klass, None):
-		log('Closed file: ' + filename + '\n', v=1)
-		if tagger.is_mp3_file(filename):
-			tagger.rename(filename, TAGGER_PATTERN)
-
-
-def archive_view(self):
-	log("Viewing URI: <" + self.url + ">", v=3)
-	filename = archive_url2filename(self.url, makeNew=0)
-	if filename == 404:
-		self.show_response(404, "The URI <code>" + self.url + "</code> could not be found.")
-		return
-	h = open(filename + '.headers').readlines()[1:]
-	for line in h:
-		self.push(line)
-	del h
-	d = open(filename).readlines()
-	for line in d:
-		self.push(line)
-
-
-###############################################################################
-def sameHost(host, port, HOST, PORT):
-	if port == PORT and (
-		(HOST == '' and (host == '127.0.0.1' or string.lower(host) == 'localhost')) 
-		or string.lower(host) == string.lower(HOST)):
-		return 1
-	else: return 0
-
-###############################################################################
-class AsyncProxyError(StandardError): pass
-
+		f.write(data)
+	
+	def archive_close(self):
+		del self.sender # break cycle
+		if self.archive and self.archive[0] and self.archive[1]:
+			f, filename = self.archive
+			f.close()
+			if tagger.is_mp3_file(filename):
+				tagger.rename(filename, TAGGER_PATTERN)
+		self.archive = None
+		self.status = 'closed'
 
 ###############################################################################
 class AsyncHTTPProxySender(asynchat.async_chat):
@@ -493,6 +444,13 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.host = host
 		self.port = port
+		self.status = 'init'
+		self.buffer = StringIO()
+		
+		if ARCHIVE_ACTION_MODE != 'off':
+			self.archiver = Archiver(self)
+		else:
+			self.archiver = None
 		try:
 			self.connect( (host, port) )
 		except socket.error, e:
@@ -514,6 +472,7 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 				self.receiver.sender_connection_error(e)
 			self.close()
 			return
+		self.status = 'headers'
 		log('(%d) sender connected\n' % self.id, 2)
 
 	def return_error(self, e):
@@ -524,13 +483,31 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		self.close()
 
 	def collect_incoming_data(self, data):
+		request = self.receiver.request
+		url = self.receiver.url
+		archiver = self.archiver
 		if DEBUG_LEVEL >= 3:
 			log('==> (%d) %s\n', args=(self.id, repr(data)), v=3)
 		else:
 			log('==> (%d) %d bytes\n', args=(self.id, len(data)), v=2)
-		if ARCHIVE_ACTION_MODE != 'off':
-			archive_connection(self, self.receiver.request, self.receiver.url, data)
-
+		if self.status == 'headers':
+			self.buffer.write(data)
+			n = self.buffer.getvalue().find('\r\n\r\n')
+			if n >= 0:
+				oldlen = len(self.buffer.getvalue())
+				# found end of headers
+				self.buffer.truncate(n+4)
+				bodystart = oldlen - (n+4)
+				data = data[bodystart:]
+				headers = self.buffer.getvalue()
+				if archiver:
+					archiver.archive_connection(request, url, headers)
+				print "----- GOT HEADERS: --------\n", headers
+				print "PARSED Content-Length:", self.parse_content_length(headers)
+				self.status = 'body'
+				
+		if self.status == 'body' and data and archiver:
+			archiver.archive_connection(request, url, data)
 		self.receiver.push(data)
 
 	def handle_close(self):
@@ -538,11 +515,22 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		if hasattr(self, 'receiver'):
 			self.receiver.close_when_done()
 			del self.receiver  # break circular reference
-		if ARCHIVE_ACTION_MODE != 'off':
-			archive_close(self)
+		if self.archiver:
+			self.archiver.archive_close()
+			self.archiver = None
 		self.close()
 
+
+	def parse_content_length(self, rawheaders):
+		headers = rawheaders.lower().split()
+		try:
+			n = headers.index('content-length:')
+			return int(headers[n+1])
+		except:
+			return -1
+
 	def handle_error(self):
+		self.archiver = None
 		handle_error(self)
 	
 	def log(self, message):
@@ -555,21 +543,29 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 
 ###############################################################################
 class AsyncHTTPProxyReceiver(asynchat.async_chat):
-	channel_counter = [0]
+	channel_counter = 0
 
 	def __init__(self, server, (conn, addr)):
-		self.id = self.channel_counter[0]  # used during log calls
-		try:
-			self.channel_counter[0] = self.channel_counter[0] + 1
-		except OverflowError:
-			self.channel_counter[0] = 0
+		self.id = self.channel_counter  # used during log calls
+		self.channel_counter = (self.channel_counter + 1) % 2**32
 		asynchat.async_chat.__init__(self, conn)
-		self.set_terminator('\n')
 		self.server = server
+		self.host = None
+		self.port = None
+		self.get_ready_for_new_request()
+		
+	def get_ready_for_new_request(self):
+		"""
+		Resets the receiver to a state ready to receive an HTTP request.
+		Called from the receiver constructor and called by the sender
+		after finishing receiving a complete response (in case of keepalives.)
+		"""
+		self.oldhost = self.host
+		self.oldport = self.port
 		self.buffer = StringIO()
-
+		self.set_terminator('\n')
 		# in the beginning there was GET...
-		self.found_terminator = self.read_http_request
+		self.found_terminator = self.read_http_method
 	
 	def collect_incoming_data(self, data):
 		self.buffer.write(data)
@@ -582,19 +578,11 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		self.sender.push(data)
 
 	#### to be used as a found_terminator method
-	def read_http_request(self):
+	def read_http_method(self):
 		self.request = self.buffer.getvalue()
 		self.buffer = StringIO()
 
 		log('%s - %s\n', args=(time.ctime(time.time()), self.request), v=1)
-
-		# client-originated shutdown hack:
-		if string.strip(self.request) == 'quit':
-			log('External quit command received.\n')
-			# On pre python 2.0 this will raise a NameError,
-			# but asyncore will handle it well.  On 2.0, it
-			# will cause asyncore to exit.
-			raise asyncore.ExitNow
 
 		try:
 			self.method, self.url, self.protocol = string.split(self.request)
@@ -639,8 +627,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		header = self.buffer.getvalue()
 		self.buffer = StringIO()
 		if header and header[0] != '\r':
-			header = header.replace('keep-alive', 'close')
-			header = header.replace('Keep-Alive', 'Close')
+			#header = header.replace('keep-alive', 'close')
+			#header = header.replace('Keep-Alive', 'Close')
 			self.rawheaders.write(header)
 			self.rawheaders.write('\n')
 		else:
@@ -652,18 +640,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			self.length = int(self.mimeheaders.get('content-length', 0))
 			del self.mimeheaders['accept-encoding']
 			del self.mimeheaders['proxy-connection']
-			
-			# check to see if we want to handle a request by the archiver
-			if self.url[0] == '/' or sameHost(self.host, self.port, ADDR_TO_BIND_TO, PORT):
-				archive_handle_request(self)
-				self.handle_close()
-				return
 
-			if ARCHIVE_ACTION_MODE == 'view':
-				archive_view(self)
-				self.handle_close()
-				return
-			
+
 			# determine the next hop (another proxy or the remote host) and open a connection
 			http_proxy = os.environ.get('http_proxy')
 			if not http_proxy :
@@ -684,7 +662,9 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 					self.path = self.url
 
 			# create a sender connection to the next hop
-			self.sender = AsyncHTTPProxySender(self, self.id, self.host, self.port)
+			# only if we are not already connected there (due to keep-alives)
+			if (self.oldhost, self.oldport) != (self.host, self.port):
+				self.sender = AsyncHTTPProxySender(self, self.id, self.host, self.port)
 
 			# send the request to the sender (this is its own method so that the sender can trigger
 			# it again should its connection fail and it needs to redirect us to another site)
@@ -758,8 +738,6 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			self.sender.handle_close()
 			del self.sender  # break circular reference
 		self.close()
-		# asyncore.poll() catches this	(XXX shouldn't need this?)
-		#raise AsyncProxyError, (code, body)
 
 	def handle_error(self):
 		handle_error(self)
@@ -793,60 +771,6 @@ class AsyncHTTPProxyServer(asyncore.dispatcher):
 	def handle_error(self):
 		handle_error()
 
-###############################################################################
-def kill_external_proxy():
-	"""
-	Kills all external instances of the proxy owned by this user.
-
-	This is a wrapper for the platform specific version.
-	"""
-	log("Stopping external proxies:\n")
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	try:
-		try:
-			s.connect(('localhost', 8000))
-			s.send('quit\r\n')
-		finally:
-			s.close()
-	except:
-		log('Could not connect to locahost 8000, oh well...\n')
-	
-def kill_external_proxy_win32():
-	import win32api, win32pdhutil, win32con
-	# XXX This code was taken from the Python1.6 Windows distribution.
-
-	# Change suggested by Dan Knierim, who found that this performed a
-	# "refresh", allowing us to kill processes created since this was run
-	# for the first time.
-	try:
-		win32pdhutil.GetPerformanceAttributes(
-			'Process','ID Process','archiverproxy')
-	except:
-		pass
-
-	try:
-		pids = win32pdhutil.FindPerformanceAttributesByName('archiverproxy')
-	except:
-		log("Not enough win32pdh library calls supported on this OS\n")
-		log("older archiverproxy processes will not be automatically killed.\n")
-		return
-
-	# If _my_ pid in there, remove it!
-	try:
-		pids.remove(win32api.GetCurrentProcessId())
-	except ValueError, e:
-		log("Strange, this proxy wasn't in the process list.\n")
-		pass
-
-	if pids:
-		for pid in pids:
-			log("Attempting to terminate pid "+str(pid)+"...\n")
-			handle = win32api.OpenProcess(win32con.PROCESS_TERMINATE, 0, pid)
-			win32api.TerminateProcess(handle,0)
-			win32api.CloseHandle(handle)
-	else:
-		log("No external proxies found.\n")
-	
 if __name__ == '__main__':
 	if len(sys.argv) >= 2 and sys.argv[1] == '--kill':
 		# Kill the other proxies:
@@ -881,10 +805,6 @@ if __name__ == '__main__':
 		else:
 			host = netloc
 			port = 80
-		
-		# do a basic checks to prevent a proxy loop
-		if sameHost(host, port, ADDR_TO_BIND_TO, PORT):
-			raise SystemExit, "Next hop proxy cannot be myself"
 
 	ps = AsyncHTTPProxyServer(PORT)
 	log("Starting service...\n")
