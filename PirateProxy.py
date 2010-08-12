@@ -85,7 +85,7 @@ TAGGER_PATTERN = '%A - %t'
 #	1 = access and error debugging
 #	2 = full debugging
 #	3 = really full debugging
-DEBUG_LEVEL = 1
+DEBUG_LEVEL = 3
 
 SHOW_ERRORS = 1
 
@@ -321,107 +321,59 @@ def file_extension_for(content_type):
 
 class Archiver(object):
 	def __init__(self, sender):
-		# (file, filename) Use a StringIO object to hold the header
-		self.archive = [StringIO(), None]
+		# (file, filename)
+		self.archive = [None, None]
 		#'init' ->'headers' -> 'body'|'noarchive' -> 'closed'
 		self.status = 'init' 
 		self.sender = sender
 	
 	def archive_headers(self, request, url, rawheaders):
-				f, filename = self.archive
-		if self.status == 'init':
-			self.status = 'headers'
-			# Clean the request header:
-			request = string.replace(request, '\r', '')
-			request = string.replace(request, '\n', '')
-			# Write out the URL/date header:
-			f.write(request + ' ' + 
-				 time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) 
-				 + '\r\n')
-		
-		# File should not be saved
-		if self.status == 'noarchive':
+		f, filename = self.archive
+		self.status = 'headers'
+		# Clean the request header:
+		request = string.replace(request, '\r', '')
+		request = string.replace(request, '\n', '')
+		# Write out the URL/date header:
+		first_line = request
+		first_line += time.strftime(' %Y-%m-%dT%H:%M:%SZ',
+				      time.gmtime(time.time()))
+		first_line += '\r\n'
+
+		self.content_type = extract_content_type(rawheaders)
+		# Discard the file if it's not among the accepted content-types:
+		if not content_type_accepted(self.content_type):
+			log('Discarding ' + url +
+				' -- content type not for archival\n', v=2)
+			self.status = 'noarchive'
 			return
 		
-		n = string.find(data, '\r\n\r\n')
-		if self.status == 'headers' and n >= 0:
-			# We've found the end of the headers
-			f.write(data[:n+4])
-			content_type = extract_content_type(data[:n+4])
-			# Discard the file if it's not among the accepted content-types:
-			if not content_type_accepted(content_type):
-				log('Discarding ' + url +
-					' -- content type not for archival\n', v=2)
-				self.archive = [None, None]
-				self.status = 'noarchive'
-				return
-			
-			# Create a directory name based on the URL
-			filename = archive_url2filename(url)
-			
-			# Store the stringIO object to a real file.
-			log('Opening file: '+filename+'\n', v=2)
-			open(filename, 'w').write(f.getvalue())
-			f.close()
-			
-			# Switch to the data file
-			data = data[n+4:]
-			filename = filename[:-len('.headers')]
-			filename = filename + file_extension_for(content_type)
-			log('Switching to file: '+filename+' -- end of headers\n', v=2)
-			f = open(filename, 'w')
-			self.archive = [f, filename]
-			self.status = 'body'
+		# Create a directory name based on the URL
+		filename = archive_url2filename(url)
 		
+		# Store the headers to a file.
+		log('Opening file: '+filename+'\n', v=2)
+		open(filename, 'w').write(first_line + rawheaders)
+		self.archive = [None, filename]
 		
 	
 	def archive_connection(self, request, url, data):
 		#print "ARCHIVE_CONNECTION" #TODO
+		assert(self.status in ('headers', 'body', 'noarchive'))
 		f, filename = self.archive
-		if self.status == 'init':
-			self.status = 'headers'
-			# Clean the request header:
-			request = string.replace(request, '\r', '')
-			request = string.replace(request, '\n', '')
-			# Write out the URL/date header:
-			f.write(request + ' ' + 
-				 time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) 
-				 + '\r\n')
 		
 		# File should not be saved
 		if self.status == 'noarchive':
 			return
-		
-		n = string.find(data, '\r\n\r\n')
-		if self.status == 'headers' and n >= 0:
-			# We've found the end of the headers
-			f.write(data[:n+4])
-			content_type = extract_content_type(data[:n+4])
-			# Discard the file if it's not among the accepted content-types:
-			if not content_type_accepted(content_type):
-				log('Discarding ' + url +
-					' -- content type not for archival\n', v=2)
-				self.archive = [None, None]
-				self.status = 'noarchive'
-				return
-			
-			# Create a directory name based on the URL
-			filename = archive_url2filename(url)
-			
-			# Store the stringIO object to a real file.
-			log('Opening file: '+filename+'\n', v=2)
-			open(filename, 'w').write(f.getvalue())
-			f.close()
-			
-			# Switch to the data file
-			data = data[n+4:]
+		log('+', v=0) #log progress
+		if self.status == 'headers':
+			# Open the data file
 			filename = filename[:-len('.headers')]
-			filename = filename + file_extension_for(content_type)
+			filename += file_extension_for(self.content_type)
 			log('Switching to file: '+filename+' -- end of headers\n', v=2)
 			f = open(filename, 'w')
 			self.archive = [f, filename]
 			self.status = 'body'
-		
+			
 		f.write(data)
 	
 	def archive_close(self):
@@ -438,19 +390,13 @@ class Archiver(object):
 class AsyncHTTPProxySender(asynchat.async_chat):
 	def __init__(self, receiver, id, host, port):
 		asynchat.async_chat.__init__(self)
+		log('Initializing new AsyncHTTPProxySender\n', v=1)
 		self.receiver = receiver
-		self.id = id
-		self.set_terminator(None)
+		self.id = id		
 		self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.host = host
 		self.port = port
-		self.status = 'init'
-		self.buffer = StringIO()
-		
-		if ARCHIVE_ACTION_MODE != 'off':
-			self.archiver = Archiver(self)
-		else:
-			self.archiver = None
+		self.init_state()		
 		try:
 			self.connect( (host, port) )
 		except socket.error, e:
@@ -459,6 +405,22 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			self.receiver.sender_connection_error(e)
 			self.close()
 			return
+		
+	def init_state(self):
+		log('S init_state\n', v=1)
+		self.set_terminator('\r\n\r\n')
+		self.found_terminator = self.end_of_headers
+		# init => headers => body => closed
+		self.status = 'init'
+		self.buffer = StringIO()
+		# Close any old archivers
+		if hasattr(self, 'archiver') and self.archiver:
+			self.archiver.archive_close()
+		if ARCHIVE_ACTION_MODE != 'off':
+			self.archiver = Archiver(self)
+		else:
+			self.archiver = None
+	
 
 	def handle_connect(self):
 		log('(%d) S handle_connect\n' % self.id, 3)
@@ -481,37 +443,62 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			e = e.args[1]  # get the error string only
 		self.receiver.error(404, 'Error connecting to <em>%s</em> on port <em>%d</em>: <b>%s</b>' % (self.host, self.port, e), response=str(e))
 		self.close()
-
+	
+	def end_of_headers(self):
+		assert(self.status == 'headers')
+		# some shorthands
+		request = self.receiver.request
+		url = self.receiver.url
+		archiver = self.archiver
+		# found end of headers
+		headers = self.buffer.getvalue()
+		del self.buffer
+		print "----- GOT HEADERS: --------\n", headers
+		self.content_length = self.parse_content_length(headers)
+		print "PARSED Content-Length:", self.content_length
+		self.keep_alive = self.parse_keepalive(headers)
+		print "PARSED Keep-Alive:", self.keep_alive
+		if self.content_length >= 0:
+			self.set_terminator(self.content_length)
+			self.found_terminator = self.end_of_content
+		else:
+			self.set_terminator(None)
+		
+		if archiver:
+			archiver.archive_headers(request, url, headers)
+		self.receiver.push(headers + '\r\n\r\n')
+		self.status = 'body'
+	
+	def end_of_content(self):
+		# after the body has been transmitted
+		# reset the sender and the receiver to
+		# handle any additional requests over the same connection
+		assert(self.status == 'body')
+		if self.keep_alive:
+			self.init_state()
+			self.receiver.get_ready_for_new_request()
+		print "End of Exchange"
+		
 	def collect_incoming_data(self, data):
 		request = self.receiver.request
 		url = self.receiver.url
 		archiver = self.archiver
-		if DEBUG_LEVEL >= 3:
-			log('==> (%d) %s\n', args=(self.id, repr(data)), v=3)
-		else:
-			log('==> (%d) %d bytes\n', args=(self.id, len(data)), v=2)
+
 		if self.status == 'headers':
 			self.buffer.write(data)
-			n = self.buffer.getvalue().find('\r\n\r\n')
-			if n >= 0:
-				oldlen = len(self.buffer.getvalue())
-				# found end of headers
-				self.buffer.truncate(n+4)
-				bodystart = oldlen - (n+4)
-				data = data[bodystart:]
-				headers = self.buffer.getvalue()
-				if archiver:
-					archiver.archive_connection(request, url, headers)
-				print "----- GOT HEADERS: --------\n", headers
-				print "PARSED Content-Length:", self.parse_content_length(headers)
-				self.status = 'body'
-				
-		if self.status == 'body' and data and archiver:
+			return
+		if self.status == 'body' and archiver:
 			archiver.archive_connection(request, url, data)
 		self.receiver.push(data)
-
+		#
+		if DEBUG_LEVEL >= 4:
+			log('==> (s:%d) %s\n', args=(self.id, repr(data)), v=4)
+		else:
+			log('==> (s:%d) %d bytes\n', args=(self.id, len(data)), v=3)
+			
 	def handle_close(self):
 		log('(%d) sender closing\n' % self.id, v=2)
+		self.status = 'closed'
 		if hasattr(self, 'receiver'):
 			self.receiver.close_when_done()
 			del self.receiver  # break circular reference
@@ -520,7 +507,6 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			self.archiver = None
 		self.close()
 
-
 	def parse_content_length(self, rawheaders):
 		headers = rawheaders.lower().split()
 		try:
@@ -528,6 +514,14 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			return int(headers[n+1])
 		except:
 			return -1
+	
+	def parse_keepalive(self, rawheaders):
+		headers = rawheaders.lower().split()
+		try:
+			n = headers.index('connection:')
+			return headers[n+1] == 'keep-alive'
+		except:
+			return False
 
 	def handle_error(self):
 		self.archiver = None
@@ -540,7 +534,6 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		if __debug__ or type != 'info':
 			log('%s: %s' % (type, message), v=0)
 	
-
 ###############################################################################
 class AsyncHTTPProxyReceiver(asynchat.async_chat):
 	channel_counter = 0
@@ -568,13 +561,15 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		self.found_terminator = self.read_http_method
 	
 	def collect_incoming_data(self, data):
-		self.buffer.write(data)
-	
-	def push_incoming_data_to_sender(self, data):
-		if DEBUG_LEVEL >= 3:
-			log('<== (%d) %s\n', args=(self.id, repr(data)), v=3)
+		# we are in buffering mode
+		if self.buffer:
+			self.buffer.write(data)
+			return
+
+		if DEBUG_LEVEL >= 4:
+			log('<== (r:%d) %s\n', args=(self.id, repr(data)), v=4)
 		else:
-			log('<== (%d) %d bytes\n', args=(self.id, len(data)), v=2)
+			log('<== (r:%d) %d bytes\n', args=(self.id, len(data)), v=3)
 		self.sender.push(data)
 
 	#### to be used as a found_terminator method
@@ -664,6 +659,10 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			# create a sender connection to the next hop
 			# only if we are not already connected there (due to keep-alives)
 			if (self.oldhost, self.oldport) != (self.host, self.port):
+				# Close the old sender, if one exists
+				if hasattr(self, 'sender') and self.sender:
+					log("Closing old sender (%d)\n"%(self.sender.id), v=2)
+					self.sender.close()
 				self.sender = AsyncHTTPProxySender(self, self.id, self.host, self.port)
 
 			# send the request to the sender (this is its own method so that the sender can trigger
@@ -679,24 +678,24 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			log('(%d) sending request to server:%s\n' % (self.id, self.host), v=2)
 		log(request, v=2)
 
+		# buffer up incoming data until the sender is ready to accept it
+		self.buffer = StringIO()
+
 		# send the request and headers on through to the next hop
-		self.sender.push(request)
+		self.buffer.write(request)
 
 		# no more formatted IO, just pass any remaining data through
 		self.set_terminator(None)
-
-		# buffer up incoming data until the sender is ready to accept it
-		self.buffer = StringIO()
 	
 	def sender_is_connected(self):
 		"""
-		The sender calls this to tell us when it is ready for more data
+		The sender calls this to tell us when it is ready for data
 		"""
 		log('(%d) R sender_is_connected()\n' % self.id, v=3)
-		# sender gave is the OK, give it our buffered data and any future data we receive
-		self.push_incoming_data_to_sender(self.buffer.getvalue())
+		# sender gave is the OK, give it our buffered data and stop buffering
+		buffered = self.buffer.getvalue()
 		self.buffer = None
-		self.collect_incoming_data = self.push_incoming_data_to_sender
+		self.collect_incoming_data(buffered)
 	
 	def sender_connection_error(self, e):
 		log('(%d) R sender_connection_error(%s) for %s:%s\n' % (self.id, e, self.host, self.port), v=2)
@@ -711,7 +710,7 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			self.sender.close_when_done()
 			del self.sender  # break circular reference
 		self.close()
-	
+
 	def show_response(self, code, body, title=None, response=None):
 		if not response:
 			response = BaseHTTPServer.BaseHTTPRequestHandler.responses[code][0]
