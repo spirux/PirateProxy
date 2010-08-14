@@ -427,15 +427,15 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		try:
 			if sys.platform != 'win32':
 				self.socket.recv(0)  # check for any socket errors during connect
-			self.receiver.sender_is_connected()
+			self.prepare_for_request()
+			log('(%d) sender connected\n' % self.id, 2)
 		except socket.error, e:
 			log('(%d) OOO %s\n' % (self.id, e))
 			if hasattr(self, 'receiver'):
 				self.receiver.sender_connection_error(e)
 			self.close()
 			return
-		self.status = 'headers'
-		log('(%d) sender connected\n' % self.id, 2)
+
 
 	def return_error(self, e):
 		log('(%d) sender got socket error: %s\n', args=(self.id, e), v=2)
@@ -474,10 +474,15 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		# reset the sender and the receiver to
 		# handle any additional requests over the same connection
 		assert(self.status == 'body')
-		if self.keep_alive:
+		if self.keep_alive or True:
 			self.init_state()
 			self.receiver.get_ready_for_new_request()
 		print "End of Exchange"
+	
+	def prepare_for_request(self):
+		# Notify receiver that we are ready to receive the response headers
+		self.receiver.sender_is_connected()
+		self.status = 'headers'
 		
 	def collect_incoming_data(self, data):
 		request = self.receiver.request
@@ -553,8 +558,11 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		Called from the receiver constructor and called by the sender
 		after finishing receiving a complete response (in case of keepalives.)
 		"""
+		if hasattr(self, 'rawheaders'):
+			del self.rawheaders
 		self.oldhost = self.host
 		self.oldport = self.port
+		# buffer up incoming data until the sender is ready to accept it
 		self.buffer = StringIO()
 		self.set_terminator('\n')
 		# in the beginning there was GET...
@@ -622,55 +630,57 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		header = self.buffer.getvalue()
 		self.buffer = StringIO()
 		if header and header[0] != '\r':
-			#header = header.replace('keep-alive', 'close')
-			#header = header.replace('Keep-Alive', 'Close')
 			self.rawheaders.write(header)
 			self.rawheaders.write('\n')
+			return
+		
+		# all headers have been read, process them
+		self.rawheaders.seek(0)
+		self.mimeheaders = mimetools.Message(self.rawheaders)
+		if (self.method == 'POST' or self.method == 'PUT') and not self.mimeheaders.has_key('content-length'):
+			self.error(400, "Missing Content-Length for %s method" % self.method)
+		self.length = int(self.mimeheaders.get('content-length', 0))
+		del self.mimeheaders['accept-encoding']
+		del self.mimeheaders['proxy-connection']
+
+
+		# determine the next hop (another proxy or the remote host) and open a connection
+		http_proxy = os.environ.get('http_proxy')
+		if not http_proxy :
+			http_proxy = os.environ.get('HTTP_PROXY')
+		# if we're chaining to another proxy, modify our request to do that
+		if http_proxy:
+			scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
+			if string.lower(scheme) == 'http' :
+				log('using next http proxy: %s\n' % netloc, 2)
+				# set host and port to the proxy
+				if ':' in netloc:
+					self.host, self.port = string.split(netloc, ':')
+					self.port = string.atoi(self.port)
+				else:
+					self.host = netloc
+					self.port = 80
+				# replace the path within the request with the full URL for the next proxy
+				self.path = self.url
+
+		# create a sender connection to the next hop
+		# only if we are not already connected there (due to keep-alives)
+		if (self.oldhost, self.oldport) == (self.host, self.port):
+			# Reuse the already existing sender
+			self.sender.prepare_for_request()
 		else:
-			# all headers have been read, process them
-			self.rawheaders.seek(0)
-			self.mimeheaders = mimetools.Message(self.rawheaders)
-			if (self.method == 'POST' or self.method == 'PUT') and not self.mimeheaders.has_key('content-length'):
-				self.error(400, "Missing Content-Length for %s method" % self.method)
-			self.length = int(self.mimeheaders.get('content-length', 0))
-			del self.mimeheaders['accept-encoding']
-			del self.mimeheaders['proxy-connection']
+			# Close the old sender, if one exists
+			if hasattr(self, 'sender') and self.sender:
+				log("Closing old sender (%d)\n"%(self.sender.id), v=2)
+				self.sender.close()
+			self.sender = AsyncHTTPProxySender(self, self.id, self.host, self.port)
 
+		# send the request to the sender (this is its own method so that the sender can trigger
+		# it again should its connection fail and it needs to redirect us to another site)
+		self.push_request_to_sender()
 
-			# determine the next hop (another proxy or the remote host) and open a connection
-			http_proxy = os.environ.get('http_proxy')
-			if not http_proxy :
-				http_proxy = os.environ.get('HTTP_PROXY')
-			# if we're chaining to another proxy, modify our request to do that
-			if http_proxy:
-				scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
-				if string.lower(scheme) == 'http' :
-					log('using next http proxy: %s\n' % netloc, 2)
-					# set host and port to the proxy
-					if ':' in netloc:
-						self.host, self.port = string.split(netloc, ':')
-						self.port = string.atoi(self.port)
-					else:
-						self.host = netloc
-						self.port = 80
-					# replace the path within the request with the full URL for the next proxy
-					self.path = self.url
-
-			# create a sender connection to the next hop
-			# only if we are not already connected there (due to keep-alives)
-			if (self.oldhost, self.oldport) != (self.host, self.port):
-				# Close the old sender, if one exists
-				if hasattr(self, 'sender') and self.sender:
-					log("Closing old sender (%d)\n"%(self.sender.id), v=2)
-					self.sender.close()
-				self.sender = AsyncHTTPProxySender(self, self.id, self.host, self.port)
-
-			# send the request to the sender (this is its own method so that the sender can trigger
-			# it again should its connection fail and it needs to redirect us to another site)
-			self.push_request_to_sender()
-	
 	def push_request_to_sender(self):
-		request = '%s %s HTTP/1.0\r\n%s\r\n' % (self.method, self.path, string.join(self.mimeheaders.headers, ''))
+		request = '%s %s %s\r\n%s\r\n' % (self.method, self.path, self.protocol, string.join(self.mimeheaders.headers, ''))
 
 		if http_proxy:
 			log('(%d) sending request to the next http proxy:\n' % self.id, v=2)
@@ -678,11 +688,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 			log('(%d) sending request to server:%s\n' % (self.id, self.host), v=2)
 		log(request, v=2)
 
-		# buffer up incoming data until the sender is ready to accept it
-		self.buffer = StringIO()
-
 		# send the request and headers on through to the next hop
-		self.buffer.write(request)
+		self.collect_incoming_data(request)
 
 		# no more formatted IO, just pass any remaining data through
 		self.set_terminator(None)
