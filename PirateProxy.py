@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Usage: python ArchiverProxy.py [[--kill | --help | port] [HTTP-PROXY]]
+"""Usage: python ArchiverProxy.py [[--help | port] [HTTP-PROXY]]
 An http proxy server which archives all your HTTP traffic.
 http://logicerror.com/archiverProxy
 
-  --kill	   Kill all other proxies and exit
   port		 The port on which to run the proxy (default %(PORT)d)
   HTTP-PROXY   The URL of another HTTP proxy to use"""
 
@@ -154,19 +153,20 @@ def handle_error(self):
 		self.handle_close() # something is pretty broken, close it
 		return
 	if DEBUG_LEVEL > 0 or SHOW_ERRORS:
-		print time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())), "An error has occurred: \r\n"
-		traceback.print_exception(sys.exc_type,sys.exc_value, sys.exc_traceback)
+		e = sys.stderr
 	else:
 		e = open('errors.txt','a')
-		e.write(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) + ' An error has occurred: \r\n')
-		traceback.print_exception(sys.exc_type,sys.exc_value, sys.exc_traceback, file=e)
-		e.write('\r\n')
+
+	e.write(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time())) + ' An error has occurred: \r\n')
+	traceback.print_exception(sys.exc_type,sys.exc_value, sys.exc_traceback, file=e)
+	e.write('\r\n')
+	
+	if e != sys.stderr:
 		e.close()
 		log('An error occurred, details are in errors.txt\n', v=0)
 		
 ###############################################################################
 # This is the section that is archiver-specific...
-
 ###############################################################################
 
 class Mp3Tagger(object):
@@ -229,9 +229,8 @@ def keep_only_domain(webpath):
 		domain = '.'.join(domain.split('.')[-2:])
 	return ['http', domain]
 	
-	
 
-def archive_url2filename(url, makeNew=1):
+def archive_url2filename(url):
 	dirname = url
 	dirname = string.replace(dirname, '://', os.sep, 1)
 	dirname = string.replace(dirname, '/', os.sep)
@@ -252,39 +251,28 @@ def archive_url2filename(url, makeNew=1):
 	dirname = string.join(dirname2, os.sep)
 
 	# Find a unique name in case of collisions:
-	if makeNew and not os.path.isdir(dirname):
+	if not os.path.isdir(dirname):
 		while os.path.exists(dirname) and not os.path.isdir(dirname):
 			dirname += '_'
 
 		os.makedirs(dirname)
 		log('Making directory: '+dirname+'\n', v=2)
 	
-	if makeNew:
-		if ARCHIVE_FILE_NAMES == 'time':
-			# Find a unique filename based on time:
-			time_i = string.split(str(time.time()), '.')[0]
-			i = 0
-			filename = str(time_i) + '.headers'
-			while filename in os.listdir(dirname):
-				i += 1
-				filename = str(time_i) + '.' + i + '.headers'
-		else:
-			# Find a unique filename with a number:
-			i = 1
-			while str(i) + '.headers' in os.listdir(dirname):
-				i += 1
-			filename = str(i) + '.headers'
+	if ARCHIVE_FILE_NAMES == 'time':
+		# Find a unique filename based on time:
+		time_i = string.split(str(time.time()), '.')[0]
+		i = 0
+		filename = str(time_i) + '.headers'
+		while filename in os.listdir(dirname):
+			i += 1
+			filename = str(time_i) + '.' + i + '.headers'
 	else:
-		if not os.access(dirname, os.F_OK): return 404 # directory doesn't exist
-		filename = "-1"
-		for file in os.listdir(dirname):
-			if (file.isdigit() # ASSUMPTION: all archived files have numeric names
-				and int(file) > int(filename) # get the biggest file
-				and len(open(os.path.join(dirname, file)).read())): # it has content
-				filename = file
-		
-		if filename == "-1": return 404
-	
+		# Find a unique filename with a number:
+		i = 1
+		while str(i) + '.headers' in os.listdir(dirname):
+			i += 1
+		filename = str(i) + '.headers'
+
 	return os.path.join(dirname, filename)
 
 
@@ -453,11 +441,9 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		# found end of headers
 		headers = self.buffer.getvalue()
 		del self.buffer
-		print "----- GOT HEADERS: --------\n", headers
+		log("----- GOT HEADERS: --------\n%s\n"%(headers) , v=3)
 		self.content_length = self.parse_content_length(headers)
-		print "PARSED Content-Length:", self.content_length
-		self.keep_alive = self.parse_keepalive(headers)
-		print "PARSED Keep-Alive:", self.keep_alive
+		log("PARSED Content-Length: %d\n"%(self.content_length), v=3)
 		if self.content_length >= 0:
 			self.set_terminator(self.content_length)
 			self.found_terminator = self.end_of_content
@@ -474,11 +460,10 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		# reset the sender and the receiver to
 		# handle any additional requests over the same connection
 		assert(self.status == 'body')
-		if self.keep_alive or True:
-			self.init_state()
-			self.receiver.get_ready_for_new_request()
-		print "End of Exchange"
-	
+		log("end_of_content\n", v=2)
+		self.init_state()
+		self.receiver.get_ready_for_new_request()
+		
 	def prepare_for_request(self):
 		# Notify receiver that we are ready to receive the response headers
 		self.receiver.sender_is_connected()
@@ -520,14 +505,6 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 		except:
 			return -1
 	
-	def parse_keepalive(self, rawheaders):
-		headers = rawheaders.lower().split()
-		try:
-			n = headers.index('connection:')
-			return headers[n+1] == 'keep-alive'
-		except:
-			return False
-
 	def handle_error(self):
 		self.archiver = None
 		handle_error(self)
@@ -588,8 +565,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		log('%s - %s\n', args=(time.ctime(time.time()), self.request), v=1)
 
 		try:
-			self.method, self.url, self.protocol = string.split(self.request)
-			self.method = string.upper(self.method)
+			self.method, self.url, self.protocol = self.request.split()
+			self.method = self.method.upper()
 		except:
 			self.error(400, "Can't parse request")
 		if not self.url:
@@ -778,12 +755,7 @@ class AsyncHTTPProxyServer(asyncore.dispatcher):
 		handle_error()
 
 if __name__ == '__main__':
-	if len(sys.argv) >= 2 and sys.argv[1] == '--kill':
-		# Kill the other proxies:
-		kill_external_proxy()
-		log("Exiting.\n")
-		raise SystemExit
-	elif len(sys.argv) >= 2 and sys.argv[1] == '--help':
+	if len(sys.argv) >= 2 and sys.argv[1] == '--help':
 		print __doc__ % {'PORT':PORT}
 		print
 		print "Version: " + __version__
