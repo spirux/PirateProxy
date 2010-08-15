@@ -602,39 +602,29 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 
 		self.rawheaders = StringIO()  # a "file" to read the headers into for mimetools.Message
 		self.found_terminator = self.read_http_headers
+		self.set_terminator('\r\n\r\n')
 
 	#### to be used as a found_terminator method
 	def read_http_headers(self):
-		header = self.buffer.getvalue()
+		self.buffer.write('\r\n\r\n')
+		headers = self.buffer
 		self.buffer = StringIO()
-		if header and header[0] != '\r':
-			self.rawheaders.write(header)
-			self.rawheaders.write('\n')
-			return
 		
 		# all headers have been read, process them
-		self.rawheaders.seek(0)
-		self.mimeheaders = mimetools.Message(self.rawheaders)
+		headers.seek(0)
+		self.mimeheaders = mimetools.Message(headers)
 		if (self.method == 'POST' or self.method == 'PUT') and not self.mimeheaders.has_key('content-length'):
 			self.error(400, "Missing Content-Length for %s method" % self.method)
 		self.length = int(self.mimeheaders.get('content-length', 0))
 		del self.mimeheaders['accept-encoding']
 		del self.mimeheaders['proxy-connection']
-
+		
+		
 		# if we're chaining to another proxy, modify our request to do that
 		if http_proxy:
-			scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
-			if string.lower(scheme) == 'http' :
-				log('using next http proxy: %s\n' % netloc, 2)
-				# set host and port to the proxy
-				if ':' in netloc:
-					self.host, self.port = string.split(netloc, ':')
-					self.port = string.atoi(self.port)
-				else:
-					self.host = netloc
-					self.port = 80
-				# replace the path within the request with the full URL for the next proxy
-				self.path = self.url
+			self.host, self.port = self.upstream_proxy()
+			# replace the path within the request with the full URL for the proxy
+			self.path = self.url
 
 		# create a sender connection to the next hop
 		# only if we are not already connected there (due to keep-alives)
@@ -677,6 +667,14 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		buffered = self.buffer.getvalue()
 		self.buffer = None
 		self.collect_incoming_data(buffered)
+		
+	def upstream_proxy(self):
+		log('using next http proxy: %s\n' % http_proxy, 2)
+		# set host and port to the proxy
+		host, port = http_proxy, "80"
+		if ':' in host:
+			host, port = string.split(host, ':')
+		return host, int(port)
 	
 	def sender_connection_error(self, e):
 		log('(%d) R sender_connection_error(%s) for %s:%s\n' % (self.id, e, self.host, self.port), v=2)
@@ -770,14 +768,6 @@ if __name__ == '__main__':
 	
 	if http_proxy :
 		log("Next hop proxy: %s\n" % http_proxy, v=1)
-		scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
-		# set host and port to the proxy
-		if ':' in netloc:
-			host, port = string.split(netloc, ':')
-			port = string.atoi(port)
-		else:
-			host = netloc
-			port = 80
 
 	ps = AsyncHTTPProxyServer(PORT)
 	log("Starting service...\n")	
