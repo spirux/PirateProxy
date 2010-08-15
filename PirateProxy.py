@@ -521,8 +521,9 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 	channel_counter = 0
 
 	def __init__(self, server, (conn, addr)):
-		self.id = self.channel_counter  # used during log calls
-		self.channel_counter = (self.channel_counter + 1) % 2**32
+		# id used during log calls
+		self.id = AsyncHTTPProxyReceiver.channel_counter
+		AsyncHTTPProxyReceiver.channel_counter = (self.id + 1) % (2**32)
 		asynchat.async_chat.__init__(self, conn)
 		self.server = server
 		self.host = None
@@ -620,11 +621,6 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		del self.mimeheaders['accept-encoding']
 		del self.mimeheaders['proxy-connection']
 
-
-		# determine the next hop (another proxy or the remote host) and open a connection
-		http_proxy = os.environ.get('http_proxy')
-		if not http_proxy :
-			http_proxy = os.environ.get('HTTP_PROXY')
 		# if we're chaining to another proxy, modify our request to do that
 		if http_proxy:
 			scheme, netloc, path, params, query, fragment = urlparse.urlparse(http_proxy)
@@ -643,6 +639,7 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		# create a sender connection to the next hop
 		# only if we are not already connected there (due to keep-alives)
 		if (self.oldhost, self.oldport) == (self.host, self.port):
+			log("Reusing sender\n", v=2)
 			# Reuse the already existing sender
 			self.sender.prepare_for_request()
 		else:
@@ -746,6 +743,7 @@ class AsyncHTTPProxyServer(asyncore.dispatcher):
 		self.listen(5)
 
 	def handle_accept(self):
+		log("handle_accept\n", v=2)
 		AsyncHTTPProxyReceiver(self, self.accept())
 	
 	def log(self, message):
@@ -766,10 +764,7 @@ if __name__ == '__main__':
 		PORT = int(sys.argv[1])
 
 	# display which proxy we're using
-	http_proxy = os.environ.get('http_proxy')
-	if not http_proxy :
-		http_proxy = os.environ.get('HTTP_PROXY')
-		
+	http_proxy = os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
 	if len(sys.argv) >= 3 :	# 3th param: the next-step HTTP proxy can specified here (overrides the environment variable)
 		http_proxy = sys.argv[2]
 	
@@ -785,6 +780,5 @@ if __name__ == '__main__':
 			port = 80
 
 	ps = AsyncHTTPProxyServer(PORT)
-	log("Starting service...\n")
-	
+	log("Starting service...\n")	
 	asyncore.loop()
