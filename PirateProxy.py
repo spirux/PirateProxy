@@ -84,7 +84,8 @@ TAGGER_PATTERN = '%A - %t'
 #	1 = access and error debugging
 #	2 = full debugging
 #	3 = really full debugging
-DEBUG_LEVEL = 3
+#	4 = even log transferred data
+DEBUG_LEVEL = 2
 
 SHOW_ERRORS = 1
 
@@ -326,7 +327,6 @@ class Archiver(object):
 		first_line += time.strftime(' %Y-%m-%dT%H:%M:%SZ',
 				      time.gmtime(time.time()))
 		first_line += '\r\n'
-
 		self.content_type = extract_content_type(rawheaders)
 		# Discard the file if it's not among the accepted content-types:
 		if not content_type_accepted(self.content_type):
@@ -395,10 +395,12 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			return
 		
 	def init_state(self):
-		log('S init_state\n', v=1)
+		log('(s:%d) init_state\n'%(self.id), v=1)
 		self.set_terminator('\r\n\r\n')
 		self.found_terminator = self.end_of_headers
 		# init => headers => body => closed
+		#                 => chunklen => ^
+		#                   ^chunkbody<
 		self.status = 'init'
 		self.buffer = StringIO()
 		# Close any old archivers
@@ -411,14 +413,14 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 	
 
 	def handle_connect(self):
-		log('(%d) S handle_connect\n' % self.id, 3)
+		log('(s:%d) handle_connect\n' % self.id, v=2)
 		try:
 			if sys.platform != 'win32':
 				self.socket.recv(0)  # check for any socket errors during connect
 			self.prepare_for_request()
-			log('(%d) sender connected\n' % self.id, 2)
+			log('(s:%d) sender connected\n' % self.id, 2)
 		except socket.error, e:
-			log('(%d) OOO %s\n' % (self.id, e))
+			log('(s:%d) OOO %s\n' % (self.id, e))
 			if hasattr(self, 'receiver'):
 				self.receiver.sender_connection_error(e)
 			self.close()
@@ -426,57 +428,114 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 
 
 	def return_error(self, e):
-		log('(%d) sender got socket error: %s\n', args=(self.id, e), v=2)
+		log('(s:%d) sender got socket error: %s\n', args=(self.id, e), v=2)
 		if isinstance(e, socket.error) and type(e.args) == type(()) and len(e.args) == 2:
 			e = e.args[1]  # get the error string only
 		self.receiver.error(404, 'Error connecting to <em>%s</em> on port <em>%d</em>: <b>%s</b>' % (self.host, self.port, e), response=str(e))
 		self.close()
+		
+	def setup_response_end_detection(self):
+		#By default, the response ends with a closing connection
+		self.set_terminator(None)
+		content_length = self.parse_content_length(self.headers)
+		self.content_length = content_length
+		log("(s:%d) Parsed Content-Length: %d\n"%(self.id, content_length), v=2)
+		if content_length >= 0:
+			self.found_terminator = self.end_of_content
+			self.set_terminator(content_length)
+		if 'transfer-encoding' in self.headers and \
+			self.headers['transfer-encoding'] == 'chunked':
+			# get ready to read the header of the next chunk
+			self.prepare_for_next_chunk()
+	
+	def found_chunk_header(self):
+		log("(s:%d)found_chunk_header()\n" % (self.id), v=3)
+		assert(self.status == 'chunklen')
+		buffered = self.buffer.getvalue()
+		if buffered == '':
+			# stopped at a '\r\n' before the chunkheader.. continue
+			self.collect_incoming_data('\r\n')
+			print 'SHOULD NEVER HAPPEN'
+			return
+		
+		chunk_length = int(buffered, 16)
+		self.status = 'chunkbody'
+		log("(s:%d) Chunk length: %d\n" % (self.id, chunk_length), v=3)
+		# Now that we know the chunk length,
+		# arrange to catch the end of the chunk
+		# +2 to also send the '\r\n' trailing the chunk
+		self.found_terminator = self.prepare_for_next_chunk
+		self.set_terminator(chunk_length + 2)
+		
+		#turn off buffering and send data
+		self.buffer = None
+		self.collect_incoming_data(buffered + '\r\n')
+		if chunk_length == 0:
+			# this was the last, empty chunk
+			self.end_of_content()
+		
+	def prepare_for_next_chunk(self):
+		assert(self.status in ('body', 'chunkbody'))
+		log("(s:%d) prepare_for_next_chunk()\n" % (self.id), v=3)
+		# get ready to read the chunk length in the buffer
+		self.status = 'chunklen'
+		#turn buffering on to read the next chunk length
+		self.buffer = StringIO()
+		self.set_terminator('\r\n')
+		self.found_terminator = self.found_chunk_header
 	
 	def end_of_headers(self):
 		assert(self.status == 'headers')
+		self.status = 'body'
 		# some shorthands
 		request = self.receiver.request
 		url = self.receiver.url
 		archiver = self.archiver
 		# found end of headers
 		headers = self.buffer.getvalue()
-		del self.buffer
-		log("----- GOT HEADERS: --------\n%s\n"%(headers) , v=3)
-		self.content_length = self.parse_content_length(headers)
-		log("PARSED Content-Length: %d\n"%(self.content_length), v=3)
-		if self.content_length >= 0:
-			self.set_terminator(self.content_length)
-			self.found_terminator = self.end_of_content
-		else:
-			self.set_terminator(None)
+		self.buffer = None
+		log("(s:%d) ----- GOT HEADERS: ----\n%s\n" % (self.id, headers) , v=2)
+		# keep the new headers in a dict
+		self.headers = self.headers_to_dict(headers)
+		self.setup_response_end_detection() #could change status to 'chunklen'
 		
 		if archiver:
 			archiver.archive_headers(request, url, headers)
 		self.receiver.push(headers + '\r\n\r\n')
-		self.status = 'body'
+		assert(self.status in ('chunklen', 'body'))
+		if self.content_length == 0:
+			# Because set_terminator(0) does nothing :)
+			self.found_terminator()			
 	
 	def end_of_content(self):
 		# after the body has been transmitted
 		# reset the sender and the receiver to
 		# handle any additional requests over the same connection
-		assert(self.status == 'body')
-		log("end_of_content\n", v=2)
+		assert(self.status in ('body', 'chunkbody'))
+		log("(s:%d) end_of_content\n" % (self.id), v=2)
+		
+		self.handle_close() #CONN_CLOSE
+		return
+		
 		self.init_state()
 		self.receiver.get_ready_for_new_request()
 		
 	def prepare_for_request(self):
+		self.status = 'headers'
 		# Notify receiver that we are ready to receive the response headers
 		self.receiver.sender_is_connected()
-		self.status = 'headers'
+
 		
 	def collect_incoming_data(self, data):
 		request = self.receiver.request
 		url = self.receiver.url
 		archiver = self.archiver
 
-		if self.status == 'headers':
+		if self.buffer:
+			assert(self.status in ['headers', 'chunklen'])
 			self.buffer.write(data)
 			return
+		
 		if self.status == 'body' and archiver:
 			archiver.archive_connection(request, url, data)
 		self.receiver.push(data)
@@ -496,12 +555,15 @@ class AsyncHTTPProxySender(asynchat.async_chat):
 			self.archiver.archive_close()
 			self.archiver = None
 		self.close()
+	
+	def headers_to_dict(self, rawheaders):
+		lines = [line for line in rawheaders.lower().split('\n') if ':' in line]
+		pairs = [(l.split(':')[0].strip(), l.split(':', 1)[1].strip()) for l in lines]
+		return dict(pairs)
 
-	def parse_content_length(self, rawheaders):
-		headers = rawheaders.lower().split()
+	def parse_content_length(self, headers):
 		try:
-			n = headers.index('content-length:')
-			return int(headers[n+1])
+			return int(headers['content-length'])
 		except:
 			return -1
 	
@@ -618,6 +680,8 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		self.length = int(self.mimeheaders.get('content-length', 0))
 		del self.mimeheaders['accept-encoding']
 		del self.mimeheaders['proxy-connection']
+		del self.mimeheaders['connection']	#CONN_CLOSE
+		self.mimeheaders['Connection'] = 'close'
 		
 		
 		# if we're chaining to another proxy, modify our request to do that
@@ -662,7 +726,7 @@ class AsyncHTTPProxyReceiver(asynchat.async_chat):
 		"""
 		The sender calls this to tell us when it is ready for data
 		"""
-		log('(%d) R sender_is_connected()\n' % self.id, v=3)
+		log('(%d) R sender_is_connected()\n' % self.id, v=2)
 		# sender gave is the OK, give it our buffered data and stop buffering
 		buffered = self.buffer.getvalue()
 		self.buffer = None
